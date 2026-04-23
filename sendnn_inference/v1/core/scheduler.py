@@ -116,6 +116,7 @@ class PoolingSpyreScheduler(SpyreScheduler):
         while holdback_queue:
             self.waiting.append(holdback_queue.popleft())
 
+        outputs._spyre_grammar_output = self.get_grammar_bitmask(outputs)  # type: ignore[attr-defined]
         return outputs
 
     def _get_matching_warmup_shapes(
@@ -255,27 +256,17 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
         holdback_queue: deque[Request] = deque()
         while self.waiting:
             holdback_queue.append(self.waiting.popleft())
+        # Also drain skipped_waiting: structured-output requests whose
+        # grammar was not yet ready get placed here by the base scheduler.
+        # We must route them through holdback to enforce the
+        # one-prefill-at-a-time constraint.
+        while self.skipped_waiting:
+            holdback_queue.append(self.skipped_waiting.pop_request())
 
         # Check if new requests can be scheduled for prefill
         while holdback_queue:
             if self.can_schedule_prefill(holdback_queue[0]):
                 new_request = holdback_queue.popleft()
-                # Remove structured_output_request
-                # NB: SpyrePlatform.validate_request() removes structured_output
-                # before the request gets here in most cases
-                # TODO: We don't currently support structured output and it
-                # breaks some assumptions the code makes. The problems is that
-                # a structured output request will stay in waiting for multiple
-                # iterations with status WAITING_FOR_FSM. To handle this
-                # properly we need to exclude such requests from entering
-                # ongoing_prefills but still pass them in the waiting queue to
-                # the base scheduler to track the FSM initialization.
-                if new_request.structured_output_request is not None:
-                    logger.warning(
-                        "Removing structured output from request: %s", new_request.request_id
-                    )
-                    new_request.structured_output_request = None
-                    new_request.status = RequestStatus.WAITING
 
                 logger.debug(
                     "Scheduling a new request (%d prompt tokens), holding back %d requests",
@@ -300,6 +291,8 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
             "Ongoing prefill requests must be in the running queue."
         )
 
+        new_prefill_candidates: list[Request] = []
+
         # Check ongoing prefills
         if self.ongoing_prefills:
             # Some running requests are currently being prefilled. We need to
@@ -322,17 +315,45 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
 
         # Check new requests to prefill
         elif len(self.waiting) > 0:
-            self.ongoing_prefills.extend(self.waiting)
-            # Hide current decodes from the scheduler
-            running_holdback = self.running
-            self.running = []
-            self.previous_step_was_prefill = True
+            # Try to promote grammar-waiting requests whose FSM is now
+            # ready, so we correctly classify ready vs not-ready requests.
+            for r in list(self.waiting):
+                if r.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
+                    so_req = r.structured_output_request
+                    if so_req and so_req.grammar:
+                        r.status = RequestStatus.WAITING
+
+            ready_to_prefill = [
+                r
+                for r in self.waiting
+                if r.status != RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR  # type: ignore[attr-defined]
+            ]
+            if ready_to_prefill:
+                new_prefill_candidates = list(self.waiting)
+                # Hide current decodes from the scheduler
+                running_holdback = self.running
+                self.running = []
+                self.previous_step_was_prefill = True
+            else:
+                # Grammar not yet initialized for any waiting request.
+                # Return them to holdback so the base scheduler doesn't
+                # try to promote and schedule them alongside decodes.
+                while self.waiting:
+                    holdback_queue.appendleft(self.waiting.pop())
+                running_holdback = []
+                self.previous_step_was_prefill = False
         else:
             self.previous_step_was_prefill = False
             running_holdback = []
 
         # delegate to super of SpyreScheduler: base V1 Scheduler
         outputs = super(SpyreScheduler, self).schedule()
+
+        # Track as ongoing prefills only the requests that were actually
+        # scheduled (i.e., moved from waiting to running by the base
+        # scheduler).
+        if new_prefill_candidates:
+            self.ongoing_prefills.extend(r for r in new_prefill_candidates if r in self.running)
 
         # restore holdbacks after running the base scheduler
         self.running = self.running + running_holdback
@@ -345,6 +366,15 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
             r.num_computed_tokens <= r.num_prompt_tokens + 1 for r in self.running
         ):
             logger.debug("Scheduled tokens in this step: %s", outputs.num_scheduled_tokens)
+
+        # Collect grammar bitmask synchronously for structured outputs.
+        # NOTE: This is done here because vllm-spyre currently combines token sampling
+        # in model_executor.execute_model() rather than implementing sample_tokens()
+        # in the model runner. This means we cannot collect the grammar bitmask
+        # asynchronously while the model is running (as done in vLLM core).
+        # TODO: Implement sample_tokens() in SpyreModelRunner to enable async grammar
+        # collection for better performance.
+        outputs._spyre_grammar_output = self.get_grammar_bitmask(outputs)  # type: ignore[attr-defined]
         return outputs
 
     def can_schedule_prefill(self, request: Request) -> bool:
