@@ -388,6 +388,10 @@ class SpyrePlatform(Platform):
         return torch.no_grad()
 
     @classmethod
+    def manual_seed_all(cls, seed: int) -> None:
+        pass
+
+    @classmethod
     def get_warmup_shapes(cls, scheduler_config) -> tuple[dict[str, int], ...]:
         assert scheduler_config.runner_type == "pooling"
         if cls._warmup_shapes is not None:
